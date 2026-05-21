@@ -28,6 +28,12 @@
             "pages": [
               "week-1/from-solana-to-ckb"
             ]
+          },
+          {
+            "group": "Week 2",
+            "pages": [
+              "week-2/scripts-validators-and-state"
+            ]
           }
         ]
       }

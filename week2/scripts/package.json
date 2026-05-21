@@ -1,0 +1,23 @@
+{
+  "name": "05-script-explorer",
+  "version": "1.0.0",
+  "description": "Week 2 CKB scripts exercises",
+  "main": "index.js",
+  "scripts": {
+    "start": "npm run exercise:5",
+    "exercise:5": "node --experimental-strip-types 05-script-explorer.ts",
+    "exercise:6": "node --experimental-strip-types 06-hash-lock-builder.ts",
+    "exercise:7": "node --experimental-strip-types 07-error-code-decoder.ts",
+    "exercise:8": "node --experimental-strip-types 08-counter-client.ts",
+    "test": "npm run exercise:5 && npm run exercise:6 && npm run exercise:7 && npm run exercise:8"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@ckb-ccc/core": "^1.12.5",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

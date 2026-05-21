@@ -1,0 +1,131 @@
+---
+title: "Scripts Don't Run. They Referee."
+description: "Week 2 on CKB, from the Solana side: lock vs type as signer-check vs program-logic, the three-field script struct, hash_type as an upgrade-authority decision, hash locks, counter type scripts, and the security bug that survives every happy-path test."
+icon: "shield-check"
+---
+
+# Scripts Don't Run. They Referee.
+
+On Solana, your program is the active piece. The runtime hands it accounts, your code decides what happens, and the chain records the result. On CKB, the script is passive. It watches a transaction someone else built and returns one byte: zero for approve, anything else for reject.
+
+That single inversion is what Week 2 is actually teaching. If it lands, the four lessons — script basics, hash locks, debugging, counter type scripts — collapse into one model. If it doesn't, every exercise feels like a smaller, mutilated version of an Anchor program with the function signatures hidden.
+
+This note is the second-week translation guide. It assumes you already finished Week 1 and the shift from accounts to cells feels natural.
+
+## Lock controls who. Type controls what.
+
+There are two script slots on every cell:
+
+- **lock script**: who is allowed to spend this cell
+- **type script** (optional): what this cell can contain, and how it can change
+
+Lock runs only when the cell is being spent. It sees the cell as an input and nothing else.
+
+Type runs on both inputs and outputs in the same execution. That asymmetry is the whole point: a type script can see the cell as it was and as it is becoming, and reject the transition if it breaks the rules.
+
+The Solana translation: `lock` is your `Signer<'info>` check pulled out of the program and shipped on the asset. `type` is your Anchor `#[account(constraint = ...)]` plus the body of your instruction handler, also pulled out and shipped on the asset. On Solana, the program owns those checks and the account is a passive data slot. On CKB, the cell carries its own rulebook and the script just enforces it.
+
+## The three-field script struct is three design choices
+
+Every script is the same shape:
+
+```
+{ code_hash, hash_type, args }
+```
+
+That looks like metadata. It's not. Each field is a separate decision:
+
+- `code_hash` names the program — closest analog is a Solana program ID, except every cell points at one explicitly instead of inheriting it through `account.owner`
+- `args` is the program's input — format defined entirely by the program itself, with no Solana equivalent at the account level (think of it as per-instance init data that the script reads on every spend)
+- `hash_type` decides whether the program can be upgraded out from under you
+
+The first two are mechanical. The third is where the interesting tradeoff hides.
+
+## hash_type is an upgrade policy
+
+There are four legal values: `data`, `data1`, `data2`, `type`. The first three pin the script to an exact binary. The fourth lets the binary be replaced.
+
+That sounds like cryptography. It's actually governance, and Solana developers have already made this exact decision under a different name:
+
+- **Pinned (`data` / `data1` / `data2`)**: the code cannot change. This is `set_upgrade_authority(None)` — the binary is frozen, bug fix means migrating every cell, and no upgrade authority can weaponize the slot. Best for application scripts where the deployer can't be trusted.
+- **Typed (`type`)**: the code can be replaced as long as the new cell carries the same type script. This is a live BPF upgrade authority — convenient for shipping fixes, but everyone using the script trusts whoever controls the upgrade.
+
+Most CKB system scripts pick `type` for the upgrade ergonomics, the same way most early Solana programs ship with a live upgrade authority. A custom application script with security-critical guarantees should pick `data2` and accept that bug fixes mean migration. There is no right answer; there is only the answer that matches your trust model.
+
+## The hash lock is the smallest possible referee
+
+Lesson 8's hash lock has one rule: spend the cell if the witness contains a preimage whose blake2b-256 hash equals the args.
+
+No signature. No key. Whoever knows the preimage spends.
+
+The Solana version of this is three moving parts: a program that hashes the witness, an account holding the expected digest, and a CPI to `system_program::transfer`. You'd deploy the program once and parameterise it per asset. The CKB version is one moving part. The lock *is* the cell's spending condition. No program to deploy, no account to read for configuration — the rule travels with the asset.
+
+Read the Rust source twice. The first read tells you what's happening. The second read tells you what isn't:
+
+- the script never moves capacity — the transaction structure does that, where on Solana you'd be in `**lamports.borrow_mut()`
+- the script never reads other cells — its rule only needs the witness and its own args, where a Solana program typically iterates `ctx.remaining_accounts`
+- the script never mutates anything — it only returns 0 or an error code, where a Solana program returns `ProgramResult` after writing
+
+That's a referee. The transaction is the move. The script is the rulebook.
+
+One detail bites people every single time: the on-chain blake2b uses CKB's `"ckb-default-hash"` personalisation. If your off-chain code uses a different blake2b variant — `noble`, plain `blake2b-256` from npm, anything that wasn't built for CKB — the hashes will never match and the script will reject every valid spend. `ccc.hashCkb` and `ckb_std::blake2b` are the matched pair. Use them.
+
+## The counter type script is state without mutation
+
+Lesson 10's counter has three rules:
+
+- create at zero
+- increment by exactly one
+- destroy freely
+
+On Solana, a counter is one handler:
+
+```rust
+pub fn increment(ctx: Context<Increment>) -> Result<()> {
+    ctx.accounts.counter.value += 1;
+    Ok(())
+}
+```
+
+The program holds the increment logic. The account is a passive byte buffer. State changes by mutation.
+
+On CKB, there is no `increment` handler. Off-chain code builds a transaction that consumes the old counter cell and creates a new one with `value + 1`. The type script sees both cells in the same execution and either approves the transition or rejects it.
+
+Imperative versus declarative. Solana says "do this to the state". CKB says "describe what the next state should look like and prove it's a legal step from the last one". The user wrote the new state before the chain ever saw it; the script's job is to refuse if the diff is wrong.
+
+Three details from the reference implementation worth pointing at:
+
+- the script counts cells in its **group**, not in the whole transaction. CKB groups by full `(code_hash, hash_type, args)` and runs the script once per group, where a Solana program is invoked once per instruction regardless of how many of its accounts are touched
+- creation is "no group inputs", destruction is "no group outputs", update is everything in between — closer in spirit to Anchor's `#[account(init)]` and `#[account(close = ...)]`, but inverted: the script infers the operation from the input/output shape instead of dispatching on instruction data
+- the script rejects updates with more than one input or output, which kills the "merge two counters into one" attack before it starts. The Solana equivalent is hand-writing constraints on `ctx.remaining_accounts` length; the CKB version is structural
+
+A type script doesn't have to be a state machine. It can enforce token supply, NFT immutability, complex multi-cell invariants. The counter is the simplest case that still demonstrates all the moving parts. If you can write it, you can write the rest.
+
+## The bug that passes every happy-path test
+
+Lesson 9 looks like a debugging tutorial. It isn't. It's a security lesson dressed as one.
+
+A CKB script reports through a single signed byte. Negative codes come from CKB-VM. Positive codes are whatever your script defines. There is no `msg!`, no return data, no `ProgramError` enum the runtime can stringify for you. You debug by classifying, not by guessing.
+
+The class of bug that matters most is the one that survives every happy-path test, and the Solana-to-CKB shift makes it sharper than it looks at first:
+
+`A lock script that forgets to return its error code after a hash mismatch is not a lock. It is a public spend permission.`
+
+On Solana, success is `Ok(())` — something your code has to write. Forget it and the function fails to compile or returns something the runtime treats as an error. The default is *not* success.
+
+On CKB, success is `return 0`. Every code path that doesn't explicitly return an error code falls through to the implicit zero. The default *is* success. If your only tests are "the right preimage works", you will ship that bug, because the success path and the silently-fallen-through failure path return the same byte.
+
+Negative tests on CKB are not a quality nicety the way they sometimes get treated on Solana. They are the security boundary. Test that the wrong preimage gets rejected. Test that an empty witness gets rejected. Test that off-by-one args length gets rejected. If any of those return zero, the lock is broken, regardless of how the happy path behaves.
+
+## What to actually build this week
+
+The four exercises in `week2/scripts` map one-to-one onto the lessons:
+
+- `05-script-explorer.ts` — inspect real testnet cells, see lock and type side by side, watch script groups collapse identical scripts into a single execution (the part with no Solana analog at all)
+- `06-hash-lock-builder.ts` — compute the args from a preimage, build the dry-run lock and unlock transactions, see the witness layout that replaces the `Signer<'info>` you'd write on Solana
+- `07-error-code-decoder.ts` — turn a CKB node error string back into the script-side cause; the table is small enough to learn in one sitting, which is what you get when the runtime gives you one byte instead of a `ProgramError` enum
+- `08-counter-client.ts` — encode and decode the u64, build the three transactions (creation, increment, destruction), see why a state machine without `&mut` looks the way it does
+
+Two reference Rust scripts live in `week2/scripts/contracts/hash-lock` and `week2/scripts/contracts/counter`. They are kept as source, not compiled artefacts, because the point this week is to read them next to the off-chain code that drives them — the same way reading an Anchor IDL next to its client is the only way to see the full picture.
+
+By the end of the week you should be able to answer three questions in one sentence each: what the lock script asserts (the new home for your signer check), what the type script asserts (the new home for your program's state-transition logic), and which error code each one returns when you break it on purpose (the replacement for every log line you would have written on Solana). If those answers come out clean, Week 2 has done its job. If they don't, the gap will compound — start with the script you can't explain and re-read its rules until the referee model fits.
